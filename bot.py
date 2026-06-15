@@ -65,7 +65,7 @@ def extract_fields(file_bytes: bytes, mime_type: str) -> dict:
     b64 = base64.b64encode(file_bytes).decode()
 
     response = groq_client.chat.completions.create(
-        model="llama-3.2-90b-vision-preview",
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{
             "role": "user",
             "content": [
