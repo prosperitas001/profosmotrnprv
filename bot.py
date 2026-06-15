@@ -4,7 +4,7 @@ import base64
 import logging
 from datetime import datetime
 
-import google.generativeai as genai
+from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 import openpyxl
@@ -15,10 +15,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 sessions: dict[int, list[dict]] = {}
 
@@ -63,21 +62,36 @@ def build_excel(rows: list[dict]) -> bytes:
 
 
 def extract_fields(file_bytes: bytes, mime_type: str) -> dict:
-    prompt = (
-        "Это направление на медицинский осмотр. "
-        "Извлеки ТОЛЬКО следующие поля и верни строго в формате JSON без markdown и пояснений:\n"
-        '{"fio": "ФИО из пункта 1", "dob": "дата рождения ДД.ММ.ГГГГ", '
-        '"gender": "муж или жен", "profession": "профессия из пункта 7"}\n'
-        "Если поле не найдено — пустая строка."
+    b64 = base64.b64encode(file_bytes).decode()
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.2-90b-vision-preview",
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{b64}"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "Это направление на медицинский осмотр. "
+                        "Извлеки ТОЛЬКО следующие поля и верни строго в формате JSON без markdown и пояснений:\n"
+                        '{"fio": "ФИО из пункта 1", "dob": "дата рождения ДД.ММ.ГГГГ", '
+                        '"gender": "муж или жен", "profession": "профессия из пункта 7"}\n'
+                        "Если поле не найдено — пустая строка."
+                    )
+                }
+            ]
+        }],
+        max_tokens=300
     )
 
-    image_part = {
-        "mime_type": mime_type,
-        "data": base64.b64encode(file_bytes).decode()
-    }
-
-    response = model.generate_content([prompt, image_part])
-    text = response.text.replace("```json", "").replace("```", "").strip()
+    text = response.choices[0].message.content
+    text = text.replace("```json", "").replace("```", "").strip()
     return json.loads(text)
 
 
@@ -165,8 +179,8 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     doc = update.message.document
 
-    if doc.mime_type not in ("application/pdf", "image/jpeg", "image/png"):
-        await update.message.reply_text("⚠️ Поддерживаются только PDF, JPG, PNG.")
+    if doc.mime_type not in ("image/jpeg", "image/png", "image/webp"):
+        await update.message.reply_text("⚠️ Groq поддерживает только фото (JPG, PNG). PDF пока не поддерживается.")
         return
 
     msg = await update.message.reply_text("🔍 Распознаю направление...")
@@ -174,27 +188,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         file = await doc.get_file()
         file_bytes = bytes(await file.download_as_bytearray())
-
-        # Gemini не поддерживает PDF напрямую через inline — конвертируем через upload
-        if doc.mime_type == "application/pdf":
-            import tempfile, pathlib
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
-            uploaded = genai.upload_file(tmp_path, mime_type="application/pdf")
-            prompt = (
-                "Это направление на медицинский осмотр. "
-                "Извлеки ТОЛЬКО следующие поля и верни строго в формате JSON без markdown и пояснений:\n"
-                '{"fio": "ФИО из пункта 1", "dob": "дата рождения ДД.ММ.ГГГГ", '
-                '"gender": "муж или жен", "profession": "профессия из пункта 7"}\n'
-                "Если поле не найдено — пустая строка."
-            )
-            response = model.generate_content([prompt, uploaded])
-            text = response.text.replace("```json", "").replace("```", "").strip()
-            fields = json.loads(text)
-            pathlib.Path(tmp_path).unlink(missing_ok=True)
-        else:
-            fields = extract_fields(file_bytes, doc.mime_type)
+        fields = extract_fields(file_bytes, doc.mime_type)
 
         sessions.setdefault(chat_id, []).append(fields)
 
