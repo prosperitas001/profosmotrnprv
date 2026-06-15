@@ -2,6 +2,8 @@ import os
 import io
 import base64
 import logging
+import tempfile
+import pathlib
 from datetime import datetime
 
 from groq import Groq
@@ -10,6 +12,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import json
+import fitz  # pymupdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +23,15 @@ GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 sessions: dict[int, list[dict]] = {}
+
+
+def pdf_to_jpg(pdf_bytes: bytes) -> bytes:
+    """Конвертирует первую страницу PDF в JPG."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    mat = fitz.Matrix(2.0, 2.0)  # x2 качество
+    pix = page.get_pixmap(matrix=mat)
+    return pix.tobytes("jpeg")
 
 
 def build_excel(rows: list[dict]) -> bytes:
@@ -61,8 +73,8 @@ def build_excel(rows: list[dict]) -> bytes:
     return buf.getvalue()
 
 
-def extract_fields(file_bytes: bytes, mime_type: str) -> dict:
-    b64 = base64.b64encode(file_bytes).decode()
+def extract_fields(image_bytes: bytes) -> dict:
+    b64 = base64.b64encode(image_bytes).decode()
 
     response = groq_client.chat.completions.create(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
@@ -71,9 +83,7 @@ def extract_fields(file_bytes: bytes, mime_type: str) -> dict:
             "content": [
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime_type};base64,{b64}"
-                    }
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
                 },
                 {
                     "type": "text",
@@ -150,16 +160,12 @@ async def cmd_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Ошибка: {e}")
 
 
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def process_image(update: Update, image_bytes: bytes):
     chat_id = update.effective_chat.id
     msg = await update.message.reply_text("🔍 Распознаю направление...")
 
     try:
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        file_bytes = bytes(await file.download_as_bytearray())
-        fields = extract_fields(file_bytes, "image/jpeg")
-
+        fields = extract_fields(image_bytes)
         sessions.setdefault(chat_id, []).append(fields)
 
         await msg.edit_text(
@@ -171,38 +177,40 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Отправьте ещё или /excel для скачивания файла."
         )
     except Exception as e:
-        logger.error(f"Photo error: {e}")
+        logger.error(f"Error: {e}")
         await msg.edit_text(f"❌ Ошибка распознавания: {e}")
 
 
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    file_bytes = bytes(await file.download_as_bytearray())
+    await process_image(update, file_bytes)
+
+
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     doc = update.message.document
 
-    if doc.mime_type not in ("image/jpeg", "image/png", "image/webp"):
-        await update.message.reply_text("⚠️ Groq поддерживает только фото (JPG, PNG). PDF пока не поддерживается.")
+    if doc.mime_type not in ("application/pdf", "image/jpeg", "image/png", "image/webp"):
+        await update.message.reply_text("⚠️ Поддерживаются: PDF, JPG, PNG.")
         return
 
-    msg = await update.message.reply_text("🔍 Распознаю направление...")
+    msg = await update.message.reply_text("📥 Загружаю файл...")
 
     try:
         file = await doc.get_file()
         file_bytes = bytes(await file.download_as_bytearray())
-        fields = extract_fields(file_bytes, doc.mime_type)
 
-        sessions.setdefault(chat_id, []).append(fields)
+        if doc.mime_type == "application/pdf":
+            await msg.edit_text("🔄 Конвертирую PDF в изображение...")
+            file_bytes = pdf_to_jpg(file_bytes)
 
-        await msg.edit_text(
-            f"✅ Добавлено (всего: {len(sessions[chat_id])}):\n\n"
-            f"👤 {fields.get('fio', '—')}\n"
-            f"🎂 {fields.get('dob', '—')}\n"
-            f"⚧ {fields.get('gender', '—')}\n"
-            f"💼 {fields.get('profession', '—')}\n\n"
-            f"Отправьте ещё или /excel для скачивания файла."
-        )
+        await msg.delete()
+        await process_image(update, file_bytes)
+
     except Exception as e:
         logger.error(f"Document error: {e}")
-        await msg.edit_text(f"❌ Ошибка распознавания: {e}")
+        await msg.edit_text(f"❌ Ошибка: {e}")
 
 
 def main():
